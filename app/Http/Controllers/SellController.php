@@ -84,6 +84,7 @@ class SellController extends Controller
 
         $business_id = request()->session()->get('user.business_id');
         $is_woocommerce = $this->moduleUtil->isModuleInstalled('Woocommerce');
+        $is_shopify = $this->moduleUtil->isModuleInstalled('Shopify');
         $is_crm = $this->moduleUtil->isModuleInstalled('Crm');
         $is_tables_enabled = $this->transactionUtil->isModuleEnabled('tables');
         $is_service_staff_enabled = $this->transactionUtil->isModuleEnabled('service_staff');
@@ -420,6 +421,9 @@ class SellController extends Controller
                     $invoice_no = $row->invoice_no;
                     if (! empty($row->woocommerce_order_id)) {
                         $invoice_no .= ' <i class="fab fa-wordpress text-primary no-print" title="'.__('lang_v1.synced_from_woocommerce').'"></i>';
+                    }
+                    if (! empty($row->shopify_order_id)) {
+                        $invoice_no .= ' <span class="label bg-info label-round no-print" title="Synced from Shopify"><i class="fas fa-shopping-cart"></i> Shopify</span>';
                     }
                     if (! empty($row->return_exists)) {
                         $invoice_no .= ' &nbsp;<small class="label bg-red label-round no-print" title="'.__('lang_v1.some_qty_returned_from_sell').'"><i class="fas fa-undo"></i></small>';
@@ -1191,6 +1195,7 @@ class SellController extends Controller
             $is_quotation = request()->input('is_quotation', 0);
 
             $is_woocommerce = $this->moduleUtil->isModuleInstalled('Woocommerce');
+            $is_shopify = $this->moduleUtil->isModuleInstalled('Shopify');
 
             $sells = Transaction::leftJoin('contacts', 'transactions.contact_id', '=', 'contacts.id')
                 ->leftJoin('users as u', 'transactions.created_by', '=', 'u.id')
@@ -1220,7 +1225,8 @@ class SellController extends Controller
                     DB::raw('COUNT( DISTINCT tsl.id) as total_items'),
                     DB::raw('SUM(tsl.quantity) as total_quantity'),
                     DB::raw("CONCAT(COALESCE(u.surname, ''), ' ', COALESCE(u.first_name, ''), ' ', COALESCE(u.last_name, '')) as added_by"),
-                    'transactions.is_export'
+                    'transactions.is_export',
+                    'transactions.shopify_order_id'
                 );
 
             if ($is_quotation == 1) {
@@ -1268,6 +1274,10 @@ class SellController extends Controller
 
             if ($is_woocommerce) {
                 $sells->addSelect('transactions.woocommerce_order_id');
+            }
+
+            if ($is_shopify) {
+                $sells->addSelect('transactions.shopify_order_id');
             }
 
             $sells->groupBy('transactions.id');
@@ -1361,6 +1371,9 @@ class SellController extends Controller
                     $invoice_no = $row->invoice_no;
                     if (! empty($row->woocommerce_order_id)) {
                         $invoice_no .= ' <i class="fab fa-wordpress text-primary no-print" title="'.__('lang_v1.synced_from_woocommerce').'"></i>';
+                    }
+                    if (! empty($row->shopify_order_id)) {
+                        $invoice_no .= ' <span class="label bg-info label-round no-print" title="Synced from Shopify"><i class="fas fa-shopping-cart"></i> Shopify</span>';
                     }
 
                     if ($row->sub_status == 'proforma') {

@@ -20,5 +20,6 @@
     "CustomDashboard": true,
     "Gym": true,
     "ZatcaIntegrationKsa": true,
-    "Shopify": true
+    "Shopify": true,
+    "FbrIntegration": true
 }

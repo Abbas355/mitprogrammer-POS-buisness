@@ -1,0 +1,11 @@
+{
+    "name": "FbrIntegration",
+    "alias": "fbrintegration",
+    "description": "FBR Digital Invoicing Integration for Pakistan",
+    "keywords": ["fbr", "digital invoicing", "pakistan", "tax"],
+    "priority": 0,
+    "providers": [
+        "Modules\\FbrIntegration\\Providers\\FbrIntegrationServiceProvider"
+    ],
+    "files": []
+}

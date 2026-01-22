@@ -92,6 +92,14 @@
 					<b>{!! $receipt_details->invoice_no_prefix !!}</b>
 				@endif
 				{{$receipt_details->invoice_no}}
+				
+				@if(!empty($receipt_details->fbr_invoice_number))
+					<br/>
+					<span class="pull-left text-left">
+						<strong>@lang('fbrintegration::lang.fbr_invoice_number'):</strong>
+						{{$receipt_details->fbr_invoice_number}}
+					</span>
+				@endif
 
 				@if(!empty($receipt_details->types_of_service))
 					<br/>

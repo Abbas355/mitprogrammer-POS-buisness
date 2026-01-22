@@ -138,6 +138,19 @@
                                 </button>
                             </div>
                         </div>
+                        
+                        <div class="row" style="margin-top: 15px;">
+                            <div class="col-md-12">
+                                <div class="alert alert-info">
+                                    <i class="fa fa-info-circle"></i> 
+                                    <strong>Cleanup Duplicates:</strong> Remove duplicate Shopify orders that were synced multiple times. 
+                                    This will keep the oldest transaction for each Shopify order and delete the rest.
+                                </div>
+                                <button type="button" class="btn btn-warning" id="cleanup_duplicates_btn">
+                                    <i class="fa fa-trash"></i> Remove Duplicate Shopify Orders
+                                </button>
+                            </div>
+                        </div>
                     </div>
                 </div>
                 @endif
@@ -239,6 +252,45 @@
                     } else {
                         toastr.error(response.msg);
                     }
+                }
+            });
+        });
+
+        // Cleanup duplicates
+        $('#cleanup_duplicates_btn').on('click', function() {
+            if (!confirm('Are you sure you want to remove duplicate Shopify orders? This action cannot be undone. The oldest transaction for each Shopify order will be kept, and all duplicates will be deleted.')) {
+                return;
+            }
+            
+            var btn = $(this);
+            btn.prop('disabled', true).html('<i class="fa fa-spinner fa-spin"></i> Cleaning up...');
+            
+            $.ajax({
+                url: '{{ route("shopify.sync.cleanup-duplicates") }}',
+                method: 'POST',
+                data: {
+                    _token: '{{ csrf_token() }}'
+                },
+                success: function(response) {
+                    btn.prop('disabled', false).html('<i class="fa fa-trash"></i> Remove Duplicate Shopify Orders');
+                    if (response.success) {
+                        toastr.success(response.msg);
+                        if (response.deleted_count > 0) {
+                            toastr.info('Deleted ' + response.deleted_count + ' duplicate transaction(s) from ' + response.duplicate_groups + ' duplicate order group(s).');
+                        } else {
+                            toastr.info('No duplicate orders found.');
+                        }
+                    } else {
+                        toastr.error(response.msg);
+                    }
+                },
+                error: function(xhr) {
+                    btn.prop('disabled', false).html('<i class="fa fa-trash"></i> Remove Duplicate Shopify Orders');
+                    var errorMsg = 'Failed to cleanup duplicates';
+                    if (xhr.responseJSON && xhr.responseJSON.msg) {
+                        errorMsg = xhr.responseJSON.msg;
+                    }
+                    toastr.error(errorMsg);
                 }
             });
         });

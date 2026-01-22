@@ -18,4 +18,17 @@
         @endforeach
 	@endif
 	</div>
+	
+	{{-- Module-specific settings tabs --}}
+	@if(!empty($module_business_settings_tabs))
+		<hr>
+		<h4>@lang('lang_v1.module_settings')</h4>
+		@foreach($module_business_settings_tabs as $module_name => $tab_data)
+			@if(!empty($tab_data) && is_array($tab_data) && isset($tab_data['view_path']))
+				<div class="row" style="margin-top: 20px;">
+					@include($tab_data['view_path'], $tab_data['view_data'] ?? [])
+				</div>
+			@endif
+		@endforeach
+	@endif
 </div>

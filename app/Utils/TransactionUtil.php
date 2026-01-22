@@ -143,6 +143,8 @@ class TransactionUtil extends Util
             'additional_expense_key_3' => ! empty($input['additional_expense_key_3']) ? $input['additional_expense_key_3'] : null,
             'additional_expense_key_4' => ! empty($input['additional_expense_key_4']) ? $input['additional_expense_key_4'] : null,
             'is_kitchen_order' => ! empty($input['is_kitchen_order']) ? 1 : 0,
+            'shopify_order_id' => ! empty($input['shopify_order_id']) ? $input['shopify_order_id'] : null,
+            'woocommerce_order_id' => ! empty($input['woocommerce_order_id']) ? $input['woocommerce_order_id'] : null,
 
         ]);
 
@@ -1226,6 +1228,11 @@ class TransactionUtil extends Util
         //Invoice info
         $output['invoice_no'] = $transaction->invoice_no;
         $output['invoice_no_prefix'] = $il->invoice_no_prefix;
+        
+        // FBR Invoice Number
+        $output['fbr_invoice_number'] = $transaction->fbr_invoice_number ?? null;
+        $output['fbr_sync_status'] = $transaction->fbr_sync_status ?? null;
+        
         $output['shipping_address'] = ! empty($transaction->shipping_address()) ? $transaction->shipping_address() : $transaction->shipping_address;
 
         //Heading & invoice label, when quotation use the quotation heading.

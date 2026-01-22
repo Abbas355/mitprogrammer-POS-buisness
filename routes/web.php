@@ -470,6 +470,11 @@ Route::middleware(['setData', 'auth', 'SetSessionData', 'language', 'timezone', 
     Route::resource('manage-modules', Install\ModulesController::class)
         ->only(['index', 'update']);
     Route::get('regenerate', [Install\ModulesController::class, 'regenerate']);
+    
+    // Central module install/uninstall routes (works even when module is disabled)
+    Route::get('modules/install/{module_name}', [Install\ModulesController::class, 'installModule'])->name('modules.install');
+    Route::get('modules/uninstall/{module_name}', [Install\ModulesController::class, 'uninstallModule'])->name('modules.uninstall');
+    Route::get('modules/update/{module_name}', [Install\ModulesController::class, 'updateModule'])->name('modules.update');
 
     Route::resource('warranties', WarrantyController::class);
 

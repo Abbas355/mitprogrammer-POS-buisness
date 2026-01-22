@@ -54,26 +54,14 @@ class ModulesController extends Controller
                 $modules[$module]['version'] = $this->moduleUtil->getModuleVersionInfo($details['name']);
             }
 
-            //Install Link.
-            try {
-                $modules[$module]['install_link'] = action('\Modules\\'.$details['name'].'\Http\Controllers\InstallController@index');
-            } catch (\Exception $e) {
-                $modules[$module]['install_link'] = '#';
-            }
+            //Install Link - Use central route that enables module first
+            $modules[$module]['install_link'] = route('modules.install', ['module_name' => $details['name']]);
 
-            //Update Link.
-            try {
-                $modules[$module]['update_link'] = action('\Modules\\'.$details['name'].'\Http\Controllers\InstallController@update');
-            } catch (\Exception $e) {
-                $modules[$module]['update_link'] = '#';
-            }
+            //Update Link - Use central route
+            $modules[$module]['update_link'] = route('modules.update', ['module_name' => $details['name']]);
 
-            //Uninstall Link.
-            try {
-                $modules[$module]['uninstall_link'] = action('\Modules\\'.$details['name'].'\Http\Controllers\InstallController@uninstall');
-            } catch (\Exception $e) {
-                $modules[$module]['uninstall_link'] = '#';
-            }
+            //Uninstall Link - Use central route
+            $modules[$module]['uninstall_link'] = route('modules.uninstall', ['module_name' => $details['name']]);
         }
 
         $is_demo = (config('app.env') == 'demo');
@@ -316,6 +304,194 @@ class ModulesController extends Controller
         }
 
         return redirect()->back()->with(['status' => $output]);
+    }
+
+    /**
+     * Central install handler - enables module first, then calls module's InstallController
+     *
+     * @param  string  $module_name
+     * @return \Illuminate\Http\Response
+     */
+    public function installModule($module_name)
+    {
+        if (!auth()->user()->can('manage_modules')) {
+            abort(403, 'Unauthorized action.');
+        }
+
+        $notAllowed = $this->moduleUtil->notAllowedInDemo();
+        if (!empty($notAllowed)) {
+            return $notAllowed;
+        }
+
+        try {
+            $module = Module::find($module_name);
+            
+            if (!$module) {
+                return redirect()->action([ModulesController::class, 'index'])
+                    ->with('status', [
+                        'success' => 0,
+                        'msg' => __('messages.something_went_wrong') . ': Module not found',
+                    ]);
+            }
+
+            // Enable the module first (so routes are available)
+            if (!$module->isEnabled()) {
+                $module->enable();
+                
+                // Clear all caches to ensure routes are loaded
+                Artisan::call('route:clear');
+                Artisan::call('config:clear');
+                Artisan::call('cache:clear');
+                Artisan::call('view:clear');
+                Cache::forget('module_assets');
+            }
+
+            // Now call the module's InstallController
+            $installControllerClass = '\Modules\\' . $module_name . '\Http\Controllers\InstallController';
+            
+            if (class_exists($installControllerClass)) {
+                $installController = new $installControllerClass($this->moduleUtil);
+                return $installController->index();
+            } else {
+                // Fallback: Do basic installation
+                Artisan::call('migrate', [
+                    '--path' => 'Modules/' . $module_name . '/Database/Migrations',
+                    '--force' => true,
+                ]);
+
+                $module_version = config(strtolower($module_name) . '.module_version', '1.0.0');
+                \App\System::addProperty(strtolower($module_name) . '_version', $module_version);
+
+                return redirect()->action([ModulesController::class, 'index'])
+                    ->with('status', [
+                        'success' => 1,
+                        'msg' => __('lang_v1.module_installed_successfully', ['module' => $module_name]),
+                    ]);
+            }
+
+        } catch (\Exception $e) {
+            \Log::error('Module Install Error', [
+                'module' => $module_name,
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+
+            return redirect()->action([ModulesController::class, 'index'])
+                ->with('status', [
+                    'success' => 0,
+                    'msg' => __('messages.something_went_wrong') . ': ' . $e->getMessage(),
+                ]);
+        }
+    }
+
+    /**
+     * Central update handler
+     *
+     * @param  string  $module_name
+     * @return \Illuminate\Http\Response
+     */
+    public function updateModule($module_name)
+    {
+        if (!auth()->user()->can('manage_modules')) {
+            abort(403, 'Unauthorized action.');
+        }
+
+        try {
+            $module = Module::find($module_name);
+            
+            if (!$module) {
+                return redirect()->action([ModulesController::class, 'index'])
+                    ->with('status', [
+                        'success' => 0,
+                        'msg' => __('messages.something_went_wrong') . ': Module not found',
+                    ]);
+            }
+
+            // Ensure module is enabled
+            if (!$module->isEnabled()) {
+                $module->enable();
+                Artisan::call('route:clear');
+                Artisan::call('config:clear');
+                Artisan::call('cache:clear');
+            }
+
+            // Call module's InstallController update method
+            $installControllerClass = '\Modules\\' . $module_name . '\Http\Controllers\InstallController';
+            
+            if (class_exists($installControllerClass)) {
+                $installController = new $installControllerClass($this->moduleUtil);
+                return $installController->update();
+            } else {
+                return redirect()->action([ModulesController::class, 'index'])
+                    ->with('status', [
+                        'success' => 0,
+                        'msg' => __('messages.something_went_wrong') . ': InstallController not found',
+                    ]);
+            }
+
+        } catch (\Exception $e) {
+            return redirect()->action([ModulesController::class, 'index'])
+                ->with('status', [
+                    'success' => 0,
+                    'msg' => __('messages.something_went_wrong') . ': ' . $e->getMessage(),
+                ]);
+        }
+    }
+
+    /**
+     * Central uninstall handler
+     *
+     * @param  string  $module_name
+     * @return \Illuminate\Http\Response
+     */
+    public function uninstallModule($module_name)
+    {
+        if (!auth()->user()->can('manage_modules')) {
+            abort(403, 'Unauthorized action.');
+        }
+
+        try {
+            $module = Module::find($module_name);
+            
+            if (!$module) {
+                return redirect()->action([ModulesController::class, 'index'])
+                    ->with('status', [
+                        'success' => 0,
+                        'msg' => __('messages.something_went_wrong') . ': Module not found',
+                    ]);
+            }
+
+            // Ensure module is enabled to access its InstallController
+            if (!$module->isEnabled()) {
+                $module->enable();
+                Artisan::call('route:clear');
+                Artisan::call('config:clear');
+            }
+
+            // Call module's InstallController uninstall method
+            $installControllerClass = '\Modules\\' . $module_name . '\Http\Controllers\InstallController';
+            
+            if (class_exists($installControllerClass)) {
+                $installController = new $installControllerClass($this->moduleUtil);
+                return $installController->uninstall();
+            } else {
+                // Fallback: Just remove version
+                \App\System::removeProperty(strtolower($module_name) . '_version');
+                
+                return redirect()->action([ModulesController::class, 'index'])
+                    ->with('status', [
+                        'success' => 1,
+                        'msg' => __('lang_v1.module_uninstalled_successfully', ['module' => $module_name]),
+                    ]);
+            }
+
+        } catch (\Exception $e) {
+            return redirect()->action([ModulesController::class, 'index'])
+                ->with('status', [
+                    'success' => 0,
+                    'msg' => __('messages.something_went_wrong') . ': ' . $e->getMessage(),
+                ]);
+        }
     }
 
     private function __available_modules()

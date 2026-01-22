@@ -28,6 +28,7 @@ Route::prefix('shopify')->middleware(['web', 'auth', 'SetSessionData', 'AdminSid
     Route::post('/sync/orders', [ShopifySyncController::class, 'syncOrders'])->name('shopify.sync.orders');
     Route::post('/sync/product/{productId}', [ShopifySyncController::class, 'syncProduct'])->name('shopify.sync.product');
     Route::get('/sync/status', [ShopifySyncController::class, 'syncStatus'])->name('shopify.sync.status');
+    Route::post('/sync/cleanup-duplicates', [ShopifySyncController::class, 'cleanupDuplicates'])->name('shopify.sync.cleanup-duplicates');
 });
 
 // Install/Uninstall routes for module management
@@ -36,6 +37,7 @@ Route::middleware(['web', 'auth', 'SetSessionData', 'AdminSidebarMenu'])->group(
     Route::get('/shopify/update', [\Modules\Shopify\Http\Controllers\InstallController::class, 'update'])->name('shopify.update');
     Route::get('/shopify/uninstall', [\Modules\Shopify\Http\Controllers\InstallController::class, 'uninstall'])->name('shopify.uninstall');
 });
+
 
 // Webhook route (no auth, signature verified)
 Route::post('/shopify/webhook/{businessId}', [ShopifyWebhookController::class, 'handleWebhook'])

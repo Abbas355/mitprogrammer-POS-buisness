@@ -817,15 +817,19 @@ class AdminSidebarMenu
             }
 
             //Settings Dropdown
+            $moduleUtil = app(ModuleUtil::class);
+            $has_fbr_module = $moduleUtil->isModuleInstalled('FbrIntegration');
+            
             if (auth()->user()->can('business_settings.access') ||
                 auth()->user()->can('barcode_settings.access') ||
                 auth()->user()->can('invoice_settings.access') ||
                 auth()->user()->can('tax_rate.view') ||
                 auth()->user()->can('tax_rate.create') ||
-                auth()->user()->can('access_package_subscriptions')) {
+                auth()->user()->can('access_package_subscriptions') ||
+                ($has_fbr_module && auth()->user()->can('business_settings.access'))) {
                 $menu->dropdown(
                     __('business.settings'),
-                    function ($sub) use ($enabled_modules) {
+                    function ($sub) use ($enabled_modules, $moduleUtil) {
                         if (auth()->user()->can('business_settings.access')) {
                             $sub->url(
                                 action([\App\Http\Controllers\BusinessController::class, 'getBusinessSettings']),
@@ -852,6 +856,16 @@ class AdminSidebarMenu
                                 ['icon' => '', 'active' => request()->segment(1) == 'barcodes']
                             );
                         }
+                        
+                        // FBR Integration Settings
+                        if ($moduleUtil->isModuleInstalled('FbrIntegration') && auth()->user()->can('business_settings.access')) {
+                            $sub->url(
+                                route('fbr.settings'),
+                                __('fbrintegration::fbr.fbr_integration'),
+                                ['icon' => '', 'active' => request()->segment(1) == 'fbr-integration']
+                            );
+                        }
+                        
                         if (auth()->user()->can('access_printers')) {
                             $sub->url(
                                 action([\App\Http\Controllers\PrinterController::class, 'index']),

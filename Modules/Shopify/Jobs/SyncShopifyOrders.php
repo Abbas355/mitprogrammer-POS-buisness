@@ -8,13 +8,16 @@ use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Modules\Shopify\Services\ShopifyApiService;
+use Modules\Shopify\Services\ProductMappingService;
 use App\Transaction;
 use App\Contact;
 use App\Product;
 use App\Variation;
 use App\Business;
 use App\BusinessLocation;
+use App\Unit;
 use App\Utils\TransactionUtil;
+use App\Utils\ProductUtil;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\DB;
 
@@ -58,39 +61,114 @@ class SyncShopifyOrders implements ShouldQueue
                 return;
             }
 
-            $page = 1;
+            // Use cursor-based pagination with since_id (Shopify REST API doesn't support page parameter)
+            $sinceId = null;
             $hasMore = true;
             $syncedCount = 0;
+            $maxIterations = 1000; // Safety limit to prevent infinite loops
+            $iterationCount = 0;
 
-            while ($hasMore) {
-                $response = $apiService->getOrders(['page' => $page, 'limit' => 250]);
-                $orders = $response['orders'] ?? [];
+            Log::info('Shopify order sync started', [
+                'business_id' => $this->businessId,
+            ]);
 
-                if (empty($orders)) {
+            while ($hasMore && $iterationCount < $maxIterations) {
+                $iterationCount++;
+                
+                $params = ['limit' => 250, 'status' => 'any'];
+                if ($sinceId) {
+                    $params['since_id'] = $sinceId;
+                }
+                
+                Log::info('Shopify order sync: Fetching orders batch', [
+                    'iteration' => $iterationCount,
+                    'since_id' => $sinceId,
+                ]);
+                
+                try {
+                    $response = $apiService->getOrders($params);
+                    $orders = $response['orders'] ?? [];
+
+                    Log::info('Shopify order sync: Orders fetched', [
+                        'count' => count($orders),
+                    ]);
+
+                    if (empty($orders)) {
+                        Log::info('Shopify order sync: No more orders to sync');
+                        $hasMore = false;
+                        break;
+                    }
+
+                    // Track the last order ID for pagination (must be outside try/catch)
+                    $lastOrderId = null;
+
+                    foreach ($orders as $shopifyOrder) {
+                        $lastOrderId = $shopifyOrder['id'] ?? null;
+                        
+                        DB::beginTransaction();
+                        try {
+                            $wasSynced = $this->syncOrder($shopifyOrder, $business, $location, $transactionUtil);
+                            if ($wasSynced) {
+                                $syncedCount++;
+                                Log::debug('Shopify order sync: Order synced successfully', [
+                                    'order_id' => $lastOrderId,
+                                    'total_synced' => $syncedCount,
+                                ]);
+                            }
+                            DB::commit();
+                        } catch (\Exception $e) {
+                            DB::rollBack();
+                            Log::error('Shopify order sync: Failed to sync order', [
+                                'order_id' => $lastOrderId,
+                                'error' => $e->getMessage(),
+                                'trace' => $e->getTraceAsString(),
+                            ]);
+                        }
+                    }
+
+                    // Update since_id to the last order ID from this batch (even if some failed)
+                    // This ensures we don't get stuck in an infinite loop
+                    if ($lastOrderId) {
+                        $sinceId = $lastOrderId;
+                        Log::info('Shopify order sync: Batch processed', [
+                            'last_order_id' => $sinceId,
+                            'orders_in_batch' => count($orders),
+                            'successfully_synced_in_batch' => $syncedCount,
+                        ]);
+                    }
+
+                    // If we got fewer orders than the limit, we've reached the end
+                    if (count($orders) < 250) {
+                        Log::info('Shopify order sync: Reached end of orders (less than 250)');
+                        $hasMore = false;
+                    }
+                    
+                } catch (\Exception $e) {
+                    Log::error('Shopify order sync: Failed to fetch orders batch', [
+                        'since_id' => $sinceId,
+                        'iteration' => $iterationCount,
+                        'error' => $e->getMessage(),
+                        'trace' => $e->getTraceAsString(),
+                    ]);
+                    
+                    // If it's a rate limit error, wait and retry
+                    if (strpos($e->getMessage(), '429') !== false || strpos($e->getMessage(), 'rate limit') !== false) {
+                        Log::warning('Shopify order sync: Rate limit hit, waiting 5 seconds');
+                        sleep(5);
+                        continue;
+                    }
+                    
+                    // For other errors, break to avoid infinite loop
                     $hasMore = false;
                     break;
                 }
+            }
 
-                foreach ($orders as $shopifyOrder) {
-                    DB::beginTransaction();
-                    try {
-                        $this->syncOrder($shopifyOrder, $business, $location, $transactionUtil);
-                        $syncedCount++;
-                        DB::commit();
-                    } catch (\Exception $e) {
-                        DB::rollBack();
-                        Log::error('Shopify order sync: Failed to sync order', [
-                            'order_id' => $shopifyOrder['id'] ?? null,
-                            'error' => $e->getMessage(),
-                        ]);
-                    }
-                }
-
-                if (count($orders) < 250) {
-                    $hasMore = false;
-                } else {
-                    $page++;
-                }
+            if ($iterationCount >= $maxIterations) {
+                Log::warning('Shopify order sync: Reached maximum iterations limit', [
+                    'max_iterations' => $maxIterations,
+                    'last_since_id' => $sinceId,
+                ]);
             }
 
             Log::info('Shopify order sync completed', [
@@ -112,25 +190,35 @@ class SyncShopifyOrders implements ShouldQueue
      */
     protected function syncOrder($shopifyOrder, $business, $location, $transactionUtil)
     {
+        $shopifyOrderId = (string) ($shopifyOrder['id'] ?? '');
+        
         // Check if order already exists
-        $transaction = Transaction::where('business_id', $business->id)
-            ->where('shopify_order_id', $shopifyOrder['id'])
+        $existingTransaction = Transaction::where('business_id', $business->id)
+            ->where('shopify_order_id', $shopifyOrderId)
             ->first();
 
-        if ($transaction) {
-            // Order already synced, skip
-            return;
+        if ($existingTransaction) {
+            // Order already synced, skip to prevent duplicates
+            Log::debug('Shopify order sync: Order already exists, skipping', [
+                'shopify_order_id' => $shopifyOrderId,
+                'transaction_id' => $existingTransaction->id,
+            ]);
+            return false; // Return false to indicate it was skipped
         }
 
         // Get or create customer
         $customer = $this->getOrCreateCustomer($shopifyOrder, $business);
+
+        // Determine status: 'final' if paid, otherwise use mapped status
+        $financialStatus = $shopifyOrder['financial_status'] ?? 'pending';
+        $status = ($financialStatus === 'paid') ? 'final' : $this->mapOrderStatus($financialStatus);
 
         // Prepare transaction data
         $transactionData = [
             'business_id' => $business->id,
             'location_id' => $location->id,
             'type' => 'sell',
-            'status' => $this->mapOrderStatus($shopifyOrder['financial_status'] ?? 'pending'),
+            'status' => $status,
             'contact_id' => $customer->id,
             'invoice_no' => $shopifyOrder['order_number'] ?? $shopifyOrder['name'],
             'transaction_date' => $shopifyOrder['created_at'],
@@ -140,48 +228,164 @@ class SyncShopifyOrders implements ShouldQueue
             'discount_type' => 'fixed',
             'discount_amount' => $shopifyOrder['total_discounts'] ?? 0,
             'shipping_charges' => $shopifyOrder['total_shipping_price_set']['shop_money']['amount'] ?? 0,
-            'shopify_order_id' => (string) $shopifyOrder['id'],
+            'shopify_order_id' => $shopifyOrderId,
             'created_by' => $business->owner_id,
         ];
 
-        // Create sell lines
+        // Create sell lines - with product sync if needed
         $sellLines = [];
+        $apiService = new ShopifyApiService($business->id);
+        $mappingService = new ProductMappingService();
+        
+        // Get default location and unit for product sync
+        $location = BusinessLocation::where('business_id', $business->id)->first();
+        $defaultUnit = Unit::where('business_id', $business->id)
+            ->whereNull('base_unit_id')
+            ->first();
+        
+        if (!$defaultUnit) {
+            Log::error('Shopify order sync: No default unit found', [
+                'business_id' => $business->id,
+            ]);
+            throw new \Exception('Default unit not configured for business');
+        }
+
         foreach ($shopifyOrder['line_items'] ?? [] as $lineItem) {
-            $product = $this->findProductByShopifyId($lineItem['product_id'] ?? null, $lineItem['variant_id'] ?? null, $business->id);
+            $shopifyProductId = $lineItem['product_id'] ?? null;
+            $shopifyVariantId = $lineItem['variant_id'] ?? null;
             
-            if (!$product) {
-                Log::warning('Shopify order sync: Product not found', [
-                    'product_id' => $lineItem['product_id'] ?? null,
-                    'variant_id' => $lineItem['variant_id'] ?? null,
+            if (!$shopifyProductId) {
+                // Product was deleted from Shopify, create placeholder product
+                Log::warning('Shopify order sync: Line item missing product_id (deleted product), creating placeholder', [
+                    'line_item' => $lineItem,
+                    'order_id' => $shopifyOrder['id'] ?? null,
                 ]);
+                
+                try {
+                    $product = $this->createPlaceholderProductForDeletedItem($lineItem, $business, $location, $defaultUnit->id);
+                    $variation = $this->createDefaultVariation($product, $shopifyVariantId, $lineItem, $location);
+                    
+                    if ($product && $variation) {
+                        $sellLines[] = [
+                            'product_id' => $product->id,
+                            'variation_id' => $variation->id,
+                            'quantity' => $lineItem['quantity'] ?? 1,
+                            'unit_price' => $lineItem['price'] ?? 0,
+                            'unit_price_inc_tax' => $lineItem['price'] ?? 0,
+                            'item_tax' => 0,
+                            'tax_id' => null,
+                        ];
+                        Log::info('Shopify order sync: Created placeholder product for deleted item', [
+                            'product_id' => $product->id,
+                            'product_name' => $product->name,
+                        ]);
+                    }
+                } catch (\Exception $e) {
+                    Log::error('Shopify order sync: Failed to create placeholder product for deleted item', [
+                        'line_item' => $lineItem,
+                        'error' => $e->getMessage(),
+                    ]);
+                }
                 continue;
             }
 
-            $variation = $product->variations()
-                ->where('shopify_variant_id', $lineItem['variant_id'])
-                ->first();
+            // Check if product exists
+            $product = $this->findProductByShopifyId($shopifyProductId, $shopifyVariantId, $business->id);
+            
+            // If product doesn't exist, fetch and sync it from Shopify
+            if (!$product) {
+                Log::info('Shopify order sync: Product not found, syncing from Shopify', [
+                    'product_id' => $shopifyProductId,
+                    'variant_id' => $shopifyVariantId,
+                    'order_id' => $shopifyOrder['id'] ?? null,
+                ]);
+                
+                try {
+                    // Fetch product from Shopify
+                    $productResponse = $apiService->getProduct($shopifyProductId);
+                    $shopifyProduct = $productResponse['product'] ?? null;
+                    
+                    if (!$shopifyProduct) {
+                        Log::error('Shopify order sync: Failed to fetch product from Shopify', [
+                            'product_id' => $shopifyProductId,
+                        ]);
+                        continue;
+                    }
+                    
+                    // Sync the product (this will create/update product and variants)
+                    $this->syncProductFromShopify($shopifyProduct, $business, $location, $mappingService, $defaultUnit->id);
+                    
+                    // Find the product again after sync
+                    $product = $this->findProductByShopifyId($shopifyProductId, $shopifyVariantId, $business->id);
+                    
+                    if (!$product) {
+                        Log::error('Shopify order sync: Product still not found after sync', [
+                            'product_id' => $shopifyProductId,
+                        ]);
+                        continue;
+                    }
+                    
+                    Log::info('Shopify order sync: Product synced successfully', [
+                        'product_id' => $shopifyProductId,
+                        'ultimatepos_product_id' => $product->id,
+                    ]);
+                    
+                } catch (\Exception $e) {
+                    Log::error('Shopify order sync: Failed to sync product', [
+                        'product_id' => $shopifyProductId,
+                        'error' => $e->getMessage(),
+                        'trace' => $e->getTraceAsString(),
+                    ]);
+                    continue; // Skip this line item if product sync fails
+                }
+            }
 
+            // Find the correct variation
+            $variation = null;
+            if ($shopifyVariantId) {
+                $variation = $product->variations()
+                    ->where('shopify_variant_id', $shopifyVariantId)
+                    ->first();
+            }
+            
+            // If variant not found, try to find or create it
             if (!$variation) {
+                // Try to find any variation for this product
                 $variation = $product->variations()->first();
+                
+                // If still no variation, create a default one
+                if (!$variation) {
+                    Log::warning('Shopify order sync: No variation found, creating default', [
+                        'product_id' => $product->id,
+                        'shopify_variant_id' => $shopifyVariantId,
+                    ]);
+                    
+                    // Create a default variation
+                    $variation = $this->createDefaultVariation($product, $shopifyVariantId, $lineItem, $location);
+                }
             }
 
             if (!$variation) {
+                Log::error('Shopify order sync: Failed to get or create variation', [
+                    'product_id' => $product->id,
+                    'shopify_variant_id' => $shopifyVariantId,
+                ]);
                 continue;
             }
 
             $sellLines[] = [
                 'product_id' => $product->id,
                 'variation_id' => $variation->id,
-                'quantity' => $lineItem['quantity'],
-                'unit_price' => $lineItem['price'],
-                'unit_price_inc_tax' => $lineItem['price'],
+                'quantity' => $lineItem['quantity'] ?? 1,
+                'unit_price' => $lineItem['price'] ?? 0,
+                'unit_price_inc_tax' => $lineItem['price'] ?? 0,
                 'item_tax' => 0,
                 'tax_id' => null,
             ];
         }
 
         if (empty($sellLines)) {
-            throw new \Exception('No valid line items found in order');
+            throw new \Exception('No valid line items found in order after product sync');
         }
 
         // Create transaction
@@ -208,11 +412,21 @@ class SyncShopifyOrders implements ShouldQueue
             false
         );
 
-        // Mark as final if paid
-        if (($shopifyOrder['financial_status'] ?? '') === 'paid') {
-            $transaction->status = 'final';
+        // Status is already set correctly above, but ensure it's saved if needed
+        // (paid orders are already set to 'final' in transactionData)
+        if ($transaction->status !== $status) {
+            $transaction->status = $status;
             $transaction->save();
         }
+        
+        Log::debug('Shopify order sync: Order synced successfully', [
+            'order_id' => $shopifyOrderId,
+            'transaction_id' => $transaction->id,
+            'status' => $transaction->status,
+            'financial_status' => $financialStatus,
+        ]);
+        
+        return true; // Return true to indicate it was successfully synced
     }
 
     /**
@@ -222,7 +436,18 @@ class SyncShopifyOrders implements ShouldQueue
     {
         $customerData = $shopifyOrder['customer'] ?? [];
         $email = $customerData['email'] ?? $shopifyOrder['email'] ?? null;
-        $name = $customerData['first_name'] . ' ' . $customerData['last_name'] ?? $shopifyOrder['name'] ?? 'Shopify Customer';
+        
+        // Build name from customer data or order data
+        $firstName = $customerData['first_name'] ?? '';
+        $lastName = $customerData['last_name'] ?? '';
+        if ($firstName || $lastName) {
+            $name = trim($firstName . ' ' . $lastName);
+        } else {
+            $name = $shopifyOrder['name'] ?? 'Shopify Customer';
+        }
+        
+        // Get phone number from multiple possible locations
+        $phone = $shopifyOrder['phone'] ?? $customerData['phone'] ?? $shopifyOrder['billing_address']['phone'] ?? $shopifyOrder['shipping_address']['phone'] ?? '';
 
         if ($email) {
             $customer = Contact::where('business_id', $business->id)
@@ -239,7 +464,7 @@ class SyncShopifyOrders implements ShouldQueue
                 'type' => 'customer',
                 'name' => $name,
                 'email' => $email,
-                'mobile' => $shopifyOrder['phone'] ?? null,
+                'mobile' => $phone ?: '', // Empty string instead of null (mobile field is NOT NULL)
                 'created_by' => $business->owner_id,
             ]);
         }
@@ -289,6 +514,253 @@ class SyncShopifyOrders implements ShouldQueue
         }
 
         return null;
+    }
+
+    /**
+     * Sync a single product from Shopify (used when product is missing during order sync)
+     */
+    protected function syncProductFromShopify($shopifyProduct, $business, $location, $mappingService, $defaultUnitId)
+    {
+        // Check if product already exists
+        $product = Product::where('business_id', $business->id)
+            ->where('shopify_product_id', $shopifyProduct['id'])
+            ->first();
+
+        $productData = $mappingService->mapFromShopify($shopifyProduct, $business->id, $location->id);
+
+        if ($product) {
+            // Update existing product (but don't overwrite image if exists)
+            if (!empty($productData['image']) && empty($product->image)) {
+                $product->update($productData);
+            } else {
+                unset($productData['image']);
+                $product->update($productData);
+            }
+            
+            // Ensure existing product has a valid SKU
+            if (empty(trim($product->sku)) || $product->sku === ' ' || $product->sku === '') {
+                $product->sku = 'SHOPIFY-' . $shopifyProduct['id'];
+                $product->save();
+            }
+        } else {
+            // Create new product
+            $productData['created_by'] = $business->owner_id;
+            $productData['unit_id'] = $defaultUnitId;
+            $productData['type'] = count($shopifyProduct['variants'] ?? []) > 1 ? 'variable' : 'single';
+            $productData['enable_stock'] = isset($shopifyProduct['variants'][0]['inventory_management']) ? 1 : 0;
+            $productData['not_for_selling'] = 0;
+            $productData['tax_type'] = 'exclusive';
+            $productData['barcode_type'] = 'C128';
+            $productData['alert_quantity'] = 0;
+
+            // Ensure SKU is set
+            if (empty($productData['sku']) || trim($productData['sku']) === '') {
+                $productData['sku'] = 'SHOPIFY-' . $shopifyProduct['id'];
+            }
+
+            $product = Product::create($productData);
+            
+            // Generate SKU if still empty
+            if (empty(trim($product->sku)) || $product->sku === ' ' || $product->sku === '') {
+                $productUtil = new ProductUtil();
+                $sku = $productUtil->generateProductSku($product->id);
+                $product->sku = $sku;
+                $product->save();
+            }
+        }
+
+        // Sync variants
+        $isSingleProduct = count($shopifyProduct['variants'] ?? []) <= 1;
+        
+        if ($isSingleProduct) {
+            // Single product - use or create DUMMY product_variation
+            $productVariation = \App\ProductVariation::where('product_id', $product->id)
+                ->where('name', 'DUMMY')
+                ->first();
+            
+            if (!$productVariation) {
+                $productVariation = \App\ProductVariation::create([
+                    'name' => 'DUMMY',
+                    'product_id' => $product->id,
+                    'is_dummy' => 1,
+                ]);
+            }
+        }
+
+        foreach ($shopifyProduct['variants'] ?? [] as $index => $shopifyVariant) {
+            $variationData = $mappingService->mapVariantFromShopify(
+                $shopifyVariant,
+                $product->id,
+                $location->id
+            );
+
+            $variation = Variation::where('product_id', $product->id)
+                ->where('shopify_variant_id', $shopifyVariant['id'])
+                ->first();
+
+            if ($variation) {
+                $variation->update($variationData);
+            } else {
+                // For variable products, create product_variation for each option
+                if (!$isSingleProduct && isset($shopifyProduct['options']) && !empty($shopifyProduct['options'])) {
+                    $optionName = $shopifyProduct['options'][0]['name'] ?? 'Default';
+                    $optionValue = $shopifyVariant['option1'] ?? 'Default';
+                    
+                    $productVariation = \App\ProductVariation::where('product_id', $product->id)
+                        ->where('name', $optionName)
+                        ->first();
+                    
+                    if (!$productVariation) {
+                        $productVariation = \App\ProductVariation::create([
+                            'name' => $optionName,
+                            'product_id' => $product->id,
+                            'is_dummy' => 0,
+                        ]);
+                    }
+                } else {
+                    // Use the DUMMY product_variation for single products
+                    if (!isset($productVariation)) {
+                        $productVariation = \App\ProductVariation::where('product_id', $product->id)
+                            ->where('name', 'DUMMY')
+                            ->first();
+                    }
+                }
+                
+                // Add product_variation_id to variation data
+                if (isset($productVariation)) {
+                    $variationData['product_variation_id'] = $productVariation->id;
+                    $variation = $productVariation->variations()->create($variationData);
+                } else {
+                    // Fallback: create variation directly
+                    $variation = Variation::create($variationData);
+                }
+            }
+
+            // Update inventory
+            if ($product->enable_stock) {
+                $mappingService->updateInventoryFromShopify(
+                    $shopifyVariant,
+                    $variation->id,
+                    $location->id
+                );
+            }
+        }
+
+        // Assign product to default location if not already assigned
+        if ($product->product_locations->isEmpty()) {
+            $product->product_locations()->sync([$location->id]);
+        }
+
+        // Update last synced timestamp
+        $product->shopify_last_synced_at = now();
+        $product->save();
+        
+        return $product;
+    }
+
+    /**
+     * Create a default variation when none exists
+     */
+    protected function createDefaultVariation($product, $shopifyVariantId, $lineItem, $location)
+    {
+        try {
+            // Get or create DUMMY product_variation
+            $productVariation = \App\ProductVariation::where('product_id', $product->id)
+                ->where('name', 'DUMMY')
+                ->first();
+            
+            if (!$productVariation) {
+                $productVariation = \App\ProductVariation::create([
+                    'name' => 'DUMMY',
+                    'product_id' => $product->id,
+                    'is_dummy' => 1,
+                ]);
+            }
+
+            // Create variation
+            $variationData = [
+                'product_id' => $product->id,
+                'product_variation_id' => $productVariation->id,
+                'name' => 'Default',
+                'sub_sku' => $lineItem['sku'] ?? $product->sku,
+                'default_sell_price' => (float) ($lineItem['price'] ?? 0),
+                'shopify_variant_id' => $shopifyVariantId ? (string) $shopifyVariantId : null,
+            ];
+
+            $variation = $productVariation->variations()->create($variationData);
+            
+            Log::info('Shopify order sync: Created default variation', [
+                'product_id' => $product->id,
+                'variation_id' => $variation->id,
+            ]);
+            
+            return $variation;
+            
+        } catch (\Exception $e) {
+            Log::error('Shopify order sync: Failed to create default variation', [
+                'product_id' => $product->id,
+                'error' => $e->getMessage(),
+            ]);
+            return null;
+        }
+    }
+
+    /**
+     * Create a placeholder product for deleted Shopify products
+     */
+    protected function createPlaceholderProductForDeletedItem($lineItem, $business, $location, $defaultUnitId)
+    {
+        try {
+            $productName = $lineItem['title'] ?? $lineItem['name'] ?? 'Deleted Product';
+            $productSku = $lineItem['sku'] ?? 'DELETED-' . ($lineItem['id'] ?? uniqid());
+            
+            // Check if placeholder product already exists (by SKU or name)
+            $existingProduct = Product::where('business_id', $business->id)
+                ->where(function($query) use ($productSku, $productName) {
+                    $query->where('sku', $productSku)
+                          ->orWhere('name', $productName);
+                })
+                ->first();
+            
+            if ($existingProduct) {
+                return $existingProduct;
+            }
+            
+            // Create placeholder product
+            $productData = [
+                'name' => $productName . ' (Deleted from Shopify)',
+                'business_id' => $business->id,
+                'type' => 'single',
+                'unit_id' => $defaultUnitId,
+                'sku' => $productSku,
+                'barcode_type' => 'C128',
+                'tax_type' => 'exclusive',
+                'enable_stock' => 0,
+                'not_for_selling' => 0,
+                'created_by' => $business->owner_id,
+            ];
+            
+            $product = Product::create($productData);
+            
+            // Assign to location
+            $product->product_locations()->sync([$location->id]);
+            
+            Log::info('Shopify order sync: Created placeholder product for deleted item', [
+                'product_id' => $product->id,
+                'product_name' => $product->name,
+                'sku' => $product->sku,
+            ]);
+            
+            return $product;
+            
+        } catch (\Exception $e) {
+            Log::error('Shopify order sync: Failed to create placeholder product', [
+                'line_item' => $lineItem,
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+            throw $e;
+        }
     }
 }
 

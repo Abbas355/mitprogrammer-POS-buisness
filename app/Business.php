@@ -18,14 +18,14 @@ class Business extends Model
      *
      * @var array
      */
-    protected $guarded = ['id', 'woocommerce_api_settings', 'shopify_api_settings'];
+    protected $guarded = ['id', 'woocommerce_api_settings', 'shopify_api_settings', 'fbr_api_settings'];
 
     /**
      * The attributes that should be hidden for arrays.
      *
      * @var array
      */
-    protected $hidden = ['woocommerce_api_settings', 'shopify_api_settings'];
+    protected $hidden = ['woocommerce_api_settings', 'shopify_api_settings', 'fbr_api_settings'];
 
     /**
      * The attributes that should be cast to native types.
@@ -40,6 +40,7 @@ class Business extends Model
         'common_settings' => 'array',
         'weighing_scale_setting' => 'array',
         'shopify_api_settings' => 'array',
+        'fbr_api_settings' => 'array',
     ];
 
     /**
