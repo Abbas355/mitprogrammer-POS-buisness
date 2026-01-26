@@ -1678,13 +1678,14 @@ class TransactionUtil extends Util
 
             $output['show_qr_code'] = ! empty($il->show_qr_code) ? true : false;
             $zatca_qr = ! empty($il->common_settings['zatca_qr']) ? true : false;
+            $qr_code_text = null; // Initialize to prevent undefined variable error
             if ($zatca_qr) {
                 $total_order_tax = $transaction->tax_amount + $total_line_taxes;
                 $zatca_phase = ! empty($il->common_settings['zatca_phase']) ? $il->common_settings['zatca_phase'] : '';
                 $qr_code_text = $this->_zatca_qr_text($business_details->name, $business_details->tax_number_1, $transaction, $total_order_tax, $zatca_phase);
             } 
 
-            if ($transaction->status == 'final') {
+            if ($transaction->status == 'final' && $qr_code_text !== null) {
                 $output['qr_code_text'] = $qr_code_text;
             }
         }

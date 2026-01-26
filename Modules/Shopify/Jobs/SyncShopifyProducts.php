@@ -193,10 +193,31 @@ class SyncShopifyProducts implements ShouldQueue
      */
     protected function syncProduct($shopifyProduct, $business, $location, $mappingService, $defaultUnitId)
     {
-        // Check if product already exists
+        $shopifyProductId = (string) ($shopifyProduct['id'] ?? '');
+        $shopifySku = $shopifyProduct['variants'][0]['sku'] ?? '';
+        
+        // Check if product already exists by shopify_product_id
         $product = Product::where('business_id', $business->id)
-            ->where('shopify_product_id', $shopifyProduct['id'])
+            ->where('shopify_product_id', $shopifyProductId)
             ->first();
+
+        // Also check by SKU as fallback (in case shopify_product_id wasn't saved)
+        if (!$product && !empty($shopifySku)) {
+            $product = Product::where('business_id', $business->id)
+                ->where('sku', $shopifySku)
+                ->first();
+            
+            // If found by SKU but doesn't have shopify_product_id, update it
+            if ($product && empty($product->shopify_product_id)) {
+                $product->shopify_product_id = $shopifyProductId;
+                $product->save();
+                Log::debug('Shopify product sync: Updated existing product with shopify_product_id', [
+                    'product_id' => $product->id,
+                    'shopify_product_id' => $shopifyProductId,
+                    'sku' => $shopifySku,
+                ]);
+            }
+        }
 
         $productData = $mappingService->mapFromShopify($shopifyProduct, $business->id, $location->id);
 

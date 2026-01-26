@@ -121,6 +121,7 @@ class ProductMappingService
 
     /**
      * Download image from URL and save to product images directory
+     * Checks if image with same URL already exists to avoid duplicate downloads
      */
     protected function downloadAndSaveImage($imageUrl, $productId = null)
     {
@@ -129,14 +130,10 @@ class ProductMappingService
                 return null;
             }
 
-            // Download image
-            $imageContent = @file_get_contents($imageUrl);
-            if ($imageContent === false) {
-                Log::warning('Shopify sync: Failed to download image', ['url' => $imageUrl]);
-                return null;
-            }
-
-            // Get file extension from URL or content
+            // Generate consistent filename based on image URL hash to avoid duplicates
+            $urlHash = md5($imageUrl);
+            
+            // Get file extension from URL
             $pathInfo = pathinfo(parse_url($imageUrl, PHP_URL_PATH));
             $extension = $pathInfo['extension'] ?? 'jpg';
             
@@ -146,8 +143,8 @@ class ProductMappingService
                 $extension = 'jpg'; // Default to jpg if extension is not recognized
             }
 
-            // Generate unique filename
-            $filename = 'shopify_' . time() . '_' . ($productId ?? uniqid()) . '.' . $extension;
+            // Generate filename based on URL hash (consistent for same URL)
+            $filename = 'shopify_' . $urlHash . '.' . $extension;
             
             // Ensure directory exists
             $uploadPath = public_path('uploads/' . config('constants.product_img_path'));
@@ -155,8 +152,36 @@ class ProductMappingService
                 mkdir($uploadPath, 0755, true);
             }
 
-            // Save image
             $filePath = $uploadPath . '/' . $filename;
+
+            // Check if file already exists (same URL was already downloaded)
+            if (file_exists($filePath)) {
+                Log::debug('Shopify sync: Image already exists, reusing', [
+                    'url' => $imageUrl,
+                    'filename' => $filename,
+                ]);
+                return $filename;
+            }
+
+            // Check if any product already uses this image (by checking existing products)
+            $existingProduct = \App\Product::where('image', $filename)->first();
+            if ($existingProduct) {
+                Log::debug('Shopify sync: Image filename already used by another product, reusing', [
+                    'url' => $imageUrl,
+                    'filename' => $filename,
+                    'existing_product_id' => $existingProduct->id,
+                ]);
+                return $filename;
+            }
+
+            // Download image (only if it doesn't exist)
+            $imageContent = @file_get_contents($imageUrl);
+            if ($imageContent === false) {
+                Log::warning('Shopify sync: Failed to download image', ['url' => $imageUrl]);
+                return null;
+            }
+
+            // Save image
             file_put_contents($filePath, $imageContent);
 
             Log::debug('Shopify sync: Image downloaded and saved', [

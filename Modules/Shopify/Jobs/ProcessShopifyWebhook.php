@@ -213,19 +213,49 @@ class ProcessShopifyWebhook implements ShouldQueue
     protected function createTransactionFromOrder($order, $business, $location, $transactionUtil)
     {
         $shopifyOrderId = (string) ($order['id'] ?? '');
+        $shopifyOrderNumber = (string) ($order['order_number'] ?? $order['name'] ?? '');
         
-        // Check if order already exists
+        // Check if order already exists by shopify_order_id
         $existingTransaction = Transaction::where('business_id', $business->id)
             ->where('shopify_order_id', $shopifyOrderId)
             ->first();
 
         if ($existingTransaction) {
             // Order already synced, skip to prevent duplicates
-            Log::debug('Shopify webhook: Order already exists, skipping', [
+            Log::debug('Shopify webhook: Order already exists by shopify_order_id, skipping', [
                 'shopify_order_id' => $shopifyOrderId,
                 'transaction_id' => $existingTransaction->id,
             ]);
             return;
+        }
+
+        // Also check by invoice_no (Shopify order number) to catch duplicates even if shopify_order_id wasn't saved
+        // Shopify order numbers are unique, so if we find a transaction with the same invoice_no, it's a duplicate
+        if (!empty($shopifyOrderNumber)) {
+            $existingByInvoiceNo = Transaction::where('business_id', $business->id)
+                ->where('type', 'sell')
+                ->where('invoice_no', $shopifyOrderNumber)
+                ->first();
+
+            if ($existingByInvoiceNo) {
+                // Order already synced (possibly without shopify_order_id), skip to prevent duplicates
+                // Also update the existing transaction with shopify_order_id if it's missing
+                if (empty($existingByInvoiceNo->shopify_order_id)) {
+                    $existingByInvoiceNo->shopify_order_id = $shopifyOrderId;
+                    $existingByInvoiceNo->save();
+                    Log::debug('Shopify webhook: Updated existing transaction with shopify_order_id', [
+                        'transaction_id' => $existingByInvoiceNo->id,
+                        'shopify_order_id' => $shopifyOrderId,
+                        'invoice_no' => $shopifyOrderNumber,
+                    ]);
+                }
+                
+                Log::debug('Shopify webhook: Order already exists by invoice_no, skipping', [
+                    'invoice_no' => $shopifyOrderNumber,
+                    'transaction_id' => $existingByInvoiceNo->id,
+                ]);
+                return;
+            }
         }
 
         // Get or create customer
@@ -242,7 +272,7 @@ class ProcessShopifyWebhook implements ShouldQueue
             'type' => 'sell',
             'status' => $status,
             'contact_id' => $customer->id,
-            'invoice_no' => $order['order_number'] ?? $order['name'],
+            'invoice_no' => $shopifyOrderNumber,
             'transaction_date' => $order['created_at'],
             'final_total' => $order['total_price'] ?? 0,
             'total_before_tax' => $order['subtotal_price'] ?? 0,
@@ -458,6 +488,9 @@ class ProcessShopifyWebhook implements ShouldQueue
             $customer = null;
         }
 
+        // Extract address from Shopify order (prioritize shipping_address, fallback to billing_address)
+        $addressData = $this->extractAddressFromOrder($order);
+
         if (!$customer) {
             $customer = Contact::create([
                 'business_id' => $business->id,
@@ -465,11 +498,102 @@ class ProcessShopifyWebhook implements ShouldQueue
                 'name' => $name,
                 'email' => $email,
                 'mobile' => $phone ?: '', // Empty string instead of null (mobile field is NOT NULL)
+                'address_line_1' => $addressData['address_line_1'] ?? null,
+                'address_line_2' => $addressData['address_line_2'] ?? null,
+                'city' => $addressData['city'] ?? null,
+                'state' => $addressData['state'] ?? null,
+                'country' => $addressData['country'] ?? null,
+                'zip_code' => $addressData['zip_code'] ?? null,
+                'shipping_address' => $addressData['shipping_address'] ?? null,
                 'created_by' => $business->owner_id,
             ]);
+        } else {
+            // Update existing customer with address if address fields are empty
+            $needsUpdate = false;
+            $updateData = [];
+            
+            if (empty($customer->address_line_1) && !empty($addressData['address_line_1'])) {
+                $updateData['address_line_1'] = $addressData['address_line_1'];
+                $needsUpdate = true;
+            }
+            if (empty($customer->address_line_2) && !empty($addressData['address_line_2'])) {
+                $updateData['address_line_2'] = $addressData['address_line_2'];
+                $needsUpdate = true;
+            }
+            if (empty($customer->city) && !empty($addressData['city'])) {
+                $updateData['city'] = $addressData['city'];
+                $needsUpdate = true;
+            }
+            if (empty($customer->state) && !empty($addressData['state'])) {
+                $updateData['state'] = $addressData['state'];
+                $needsUpdate = true;
+            }
+            if (empty($customer->country) && !empty($addressData['country'])) {
+                $updateData['country'] = $addressData['country'];
+                $needsUpdate = true;
+            }
+            if (empty($customer->zip_code) && !empty($addressData['zip_code'])) {
+                $updateData['zip_code'] = $addressData['zip_code'];
+                $needsUpdate = true;
+            }
+            if (empty($customer->shipping_address) && !empty($addressData['shipping_address'])) {
+                $updateData['shipping_address'] = $addressData['shipping_address'];
+                $needsUpdate = true;
+            }
+            
+            if ($needsUpdate) {
+                $customer->update($updateData);
+                Log::debug('Shopify webhook: Updated customer address', [
+                    'customer_id' => $customer->id,
+                    'updated_fields' => array_keys($updateData),
+                ]);
+            }
         }
 
         return $customer;
+    }
+
+    /**
+     * Extract address data from Shopify order
+     */
+    protected function extractAddressFromOrder($order)
+    {
+        // Prioritize shipping_address, fallback to billing_address
+        $address = $order['shipping_address'] ?? $order['billing_address'] ?? [];
+        
+        $addressData = [
+            'address_line_1' => $address['address1'] ?? $address['address_1'] ?? null,
+            'address_line_2' => $address['address2'] ?? $address['address_2'] ?? null,
+            'city' => $address['city'] ?? null,
+            'state' => $address['province'] ?? $address['province_code'] ?? $address['state'] ?? null,
+            'country' => $address['country'] ?? $address['country_code'] ?? null,
+            'zip_code' => $address['zip'] ?? $address['postal_code'] ?? null,
+        ];
+        
+        // Build full shipping address as text
+        $shippingAddressParts = [];
+        if (!empty($addressData['address_line_1'])) {
+            $shippingAddressParts[] = $addressData['address_line_1'];
+        }
+        if (!empty($addressData['address_line_2'])) {
+            $shippingAddressParts[] = $addressData['address_line_2'];
+        }
+        if (!empty($addressData['city'])) {
+            $shippingAddressParts[] = $addressData['city'];
+        }
+        if (!empty($addressData['state'])) {
+            $shippingAddressParts[] = $addressData['state'];
+        }
+        if (!empty($addressData['country'])) {
+            $shippingAddressParts[] = $addressData['country'];
+        }
+        if (!empty($addressData['zip_code'])) {
+            $shippingAddressParts[] = $addressData['zip_code'];
+        }
+        
+        $addressData['shipping_address'] = !empty($shippingAddressParts) ? implode(', ', $shippingAddressParts) : null;
+        
+        return $addressData;
     }
 
     /**
